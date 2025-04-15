@@ -1,0 +1,245 @@
+---
+title: "UDM Pilot Continuous Outcome"
+author: "Benjamin Wade"
+format: html
+editor: visual
+---
+
+## Load libraries
+
+```{r}
+require(dplyr)
+require(janitor)
+require(fastDummies)
+require(missMethods)
+require(tidymodels)
+require(parsnip)
+require(yardstick)
+require(vip)
+require(ggplot2)
+require(treeshap)
+require(shapviz)
+require(kernelshap)
+```
+
+## Set pipeline parameters
+
+```{r}
+# set outcome
+outcome <- 'bdi_score_fu'
+
+# set parameters
+n_inner <- 10
+n_outer <- 10
+n_perm <- 10 # increase to 1000
+
+# set paths
+path_data <- '/path/to/CollaborationCHUM_MGH/'
+```
+
+## Format data
+
+```{r}
+ # load data
+  data <- read.csv(paste0(path_data, '6.synthetic_data_synthpop.csv'))
+  
+  # drop unwanted columns
+  data <- data %>%
+    dplyr::select(-comorbidities)
+  
+  # dummy variable encoding
+  data <- fastDummies::dummy_cols(data, select_columns = c("tx_protocol_machine", "tx_protocol_raw", "tx_protocol", "stim_site", "bobine", "dx_principal"),
+                                  remove_selected_columns=TRUE, ignore_na=TRUE)
+  
+  # temporary handling of episode_passe_bl: consider bins later
+  data$episode_passe_bl <- as.numeric(gsub('>=', '', data$episode_passe_bl))
+  
+  # clean up names
+  data <- data %>%
+    janitor::clean_names()
+  
+  # remove observations with missing outcomes
+  data_ss <- data[-which(is.na(data[[outcome]])), ]
+  
+  # set outcome 
+  y <- data_ss[[outcome]]
+  
+  # drop follow-up variables
+  data_ss <- data_ss[, !names(data) %in% c(grep('_fu', names(data), value = T), 'id')]
+  
+  # reset outcome
+  data_clf <- data.frame(
+    outcome=y,
+    data_ss
+  )
+```
+
+## Fit random forest
+
+```{r}
+# resample data
+set.seed(123)
+folds <- vfold_cv(data_clf, v=n_inner, repeats = n_outer, strata = outcome)
+
+# Model specification
+rf_mod <- rand_forest(mode='regression', trees = 1000) %>%
+  set_engine('ranger', importance = 'permutation')
+
+# model recipe with median imputation
+rec <- 
+  recipe(outcome ~ ., data = data_clf) %>%
+  step_impute_median(all_numeric_predictors())
+
+# set workflow
+rf_workflow <- 
+  workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(rf_mod)
+
+# set model control
+ctrl <- control_grid(verbose = FALSE, save_pred = TRUE, save_workflow = TRUE)
+
+# evaluation metrics
+metric_list <- metric_set(yardstick::rsq_trad, yardstick::rsq, yardstick::rmse)
+
+# fit model to resampled data
+set.seed(123)
+rf_fit <- rf_workflow %>%
+  fit_resamples(folds, metrics = metric_list, control = ctrl)
+  
+```
+
+## Model performance
+
+```{r}
+# print model performance
+kable(collect_metrics(rf_fit))
+```
+
+## Permutation test
+
+```{r}
+permuted_performance_list <- lapply(1:n_perm, function(p){
+  
+  data_clf_perm <- data_clf
+  
+  set.seed(p)
+  data_clf_perm$outcome <- sample(data_clf_perm$outcome, replace = FALSE)
+  
+  # resample
+  set.seed(p)
+  folds_perm <- vfold_cv(data_clf_perm, v=n_inner, repeats = n_outer, strata = outcome)
+  
+  # Model specification
+  rf_mod_perm <- rand_forest(mode='regression', trees = 1000) %>%
+    set_engine('ranger', importance = 'permutation')
+  
+  rec_perm <- 
+    recipe(outcome ~ ., data = data_clf_perm) %>%
+    step_impute_median(all_numeric_predictors())
+  
+  rf_workflow_perm <- 
+    workflow() %>% 
+    add_recipe(rec_perm) %>% 
+    add_model(rf_mod_perm)
+  
+  set.seed(p)
+  rf_fit_perm <- rf_workflow_perm %>%
+    fit_resamples(folds_perm, metrics = metric_list)
+  
+  permutation_metrics <- collect_metrics(rf_fit_perm)
+  
+  return(permutation_metrics)
+  
+})  
+
+# aggregate permutation distributions for all metrics
+permuted_performance_df <- do.call(rbind, permuted_performance_list)
+permuted_performance_by_metric <- split(permuted_performance_df, permuted_performance_df$.metric)
+
+# function to plot permutation distribution versus observed value
+plot_permutation <- function(perm_dist, observed, metric){
+  hist_data <- c(perm_dist, observed)
+  hist(perm_dist, xlim = range(hist_data), col = 'lightblue', 
+       main = sprintf('%s permutation distribution', metric))
+  abline(v = observed, lty=2, col = 'red')
+}
+
+# permutation test: R^2 traditional
+mean_rsq_trad_observed <- collect_metrics(rf_fit) %>%
+  dplyr::filter(.metric=='rsq_trad') %>%
+  dplyr::select(mean)
+
+p_rsq_trad <- ( sum(permuted_performance_by_metric$rsq_trad$mean >= mean_rsq_trad_observed$mean) + 1) / (n_perm + 1)
+
+print(sprintf("p-value (RSQ Traditional: %s)", p_rsq_trad))
+
+plot_permutation(perm_dist = permuted_performance_by_metric$rsq_trad$mean, 
+                 observed = mean_rsq_trad_observed$mean, metric = 'RSQ Traditional')
+
+# permutation test: R^2 
+mean_rsq_observed <- collect_metrics(rf_fit) %>%
+  dplyr::filter(.metric=='rsq') %>%
+  dplyr::select(mean)
+
+p_rsq <- ( sum(permuted_performance_by_metric$rsq$mean >= mean_rsq_observed$mean) + 1) / (n_perm + 1)
+
+print(sprintf("p-value (RSQ: %s)", p_rsq))
+
+plot_permutation(perm_dist = permuted_performance_by_metric$rsq$mean, 
+                 observed = mean_rsq_observed$mean, metric = 'RSQ')
+
+# permutation test: RMSE
+mean_rmse_observed <- collect_metrics(rf_fit) %>%
+  dplyr::filter(.metric=='rmse') %>%
+  dplyr::select(mean)
+
+p_rmse <- ( sum(permuted_performance_by_metric$rmse$mean <= mean_rmse_observed$mean) + 1) / (n_perm + 1)
+
+print(sprintf("p-value (RMSE: %s)", p_rmse))
+
+plot_permutation(perm_dist = permuted_performance_by_metric$rmse$mean, 
+                 observed = mean_rmse_observed$mean, metric = 'RMSE')
+
+p_values_df <- data.frame(metrics = c('rsq_trad', 'rsq', 'rmse'), 
+                       p=c(p_rsq_trad, p_rsq, p_rmse))
+```
+
+## SHAP evaluation
+
+```{r}
+## SHAP explanations
+best_params <- select_best(rf_fit)
+final_model <- finalize_workflow(rf_workflow, best_params) %>%
+  fit(data_clf)
+
+# SHAP interpretation
+shap_data <- data_clf %>% dplyr::select(-outcome)
+shap_explainer <- kernelshap(final_model, X = shap_data, bg_X = shap_data)
+```
+
+### Beeswarm plot
+
+```{r}
+# visualize SHAP values
+sv <- shapviz(shap_explainer, X = shap_data)
+sv_importance(sv, kind = "bee")
+```
+
+### Partial dependence plot
+
+```{r}
+#| warning: false
+# dependence plots for select variables: can make this a loop to print out pdfs for arbitrary number of features later
+sv_dependence(sv, v = 'age', X = shap_data, color_var = NULL)
+sv_dependence(sv, v = 'bai_21_bl', X = shap_data, color_var = NULL)
+sv_dependence(sv, v = 'qfs_vci_2_bl', X = shap_data, color_var = NULL)
+```
+
+### Waterfall plots
+
+```{r}
+sv_waterfall(sv, row_id = 1)
+sv_waterfall(sv, row_id = 22)
+sv_waterfall(sv, row_id = 142)
+```
